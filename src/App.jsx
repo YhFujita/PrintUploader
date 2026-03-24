@@ -150,7 +150,7 @@ function App() {
     if (category !== 'kids') setFilterMode('shadow'); else setFilterMode('shadow');
   };
 
-  // ===== キューに画像を追加 =====
+  // ===== キューに画像を追加（追加後すぐにアップロード開始） =====
   const addToQueue = () => {
     if (!processedImage) return;
     // サムネイルは小さく作る（メモリ節約のため）
@@ -176,14 +176,24 @@ function App() {
         status: STATUS.PENDING,
         error: null
       };
-      setUploadQueue(prev => [...prev, newItem]);
+
+      // 新アイテムを含む最新のキューを取得して直接アップロードトリガーへ渡す
+      setUploadQueue(prev => {
+        const newQueue = [...prev, newItem];
+        // アップロード中でなければ即座に開始する
+        if (!isUploadingRef.current) {
+          // setStateは非同期なので、最新のキューをそのまま渡して処理する
+          setTimeout(() => processQueueWithItems(newQueue), 0);
+        }
+        return newQueue;
+      });
 
       // リセットして次の撮影へ
       setCapturedImage(null);
       setProcessedImage(null);
       setComment('');
       setCurrentView('capture');
-      setStatus(`✅ キューに追加しました（合計 ${uploadQueue.length + 1} 枚）`);
+      setStatus('⚡ 追加＆アップロード開始！');
       setTimeout(() => setStatus(''), 2000);
     };
     thumbImg.src = processedImage;
@@ -245,17 +255,17 @@ function App() {
     return data;
   };
 
-  // ===== キュー内の全てのpending/failedアイテムを順次アップロード =====
-  const processQueue = useCallback(async () => {
+
+  // ===== キュー内のpending/failedアイテムを順次アップロード =====
+  // items: 処理対象のキュー配列。指定なしの場合はstateのuploadQueueを使う
+  const processQueueWithItems = async (items) => {
     if (isUploadingRef.current) return;
     isUploadingRef.current = true;
     setIsUploading(true);
 
-    // pending または failed を対象にする
-    const itemsToUpload = uploadQueue.filter(i => i.status === STATUS.PENDING || i.status === STATUS.FAILED);
+    const itemsToUpload = (items || uploadQueue).filter(i => i.status === STATUS.PENDING || i.status === STATUS.FAILED);
 
     for (const item of itemsToUpload) {
-      // ステータスを「uploading」に変更
       setUploadQueue(prev => prev.map(i => i.id === item.id ? { ...i, status: STATUS.UPLOADING, error: null } : i));
       
       try {
@@ -265,13 +275,18 @@ function App() {
         setUploadQueue(prev => prev.map(i => i.id === item.id ? { ...i, status: STATUS.FAILED, error: error.message } : i));
       }
 
-      // 少し待ってからGASへの負荷を分散する
+      // GASへの負荷を分散
       await new Promise(r => setTimeout(r, 500));
     }
 
     isUploadingRef.current = false;
     setIsUploading(false);
-  }, [uploadQueue]);
+  };
+
+  // キュー画面の「アップロード開始」ボタン用（引数なしで現在のstateを使う）
+  const processQueue = () => processQueueWithItems(null);
+
+
 
   // ===== 完了済みアイテムを一括削除 =====
   const clearCompleted = () => {
