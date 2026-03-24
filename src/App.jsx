@@ -61,12 +61,19 @@ function App() {
   // クロップ枠の初期化（画像が読み込まれた時）
   const onImageLoad = (e) => {
     const { width, height } = e.currentTarget;
-    const initialCrop = centerCrop(
-      makeAspectCrop({ unit: '%', width: 90, height: 90 }, width / height, width, height),
-      width,
-      height
-    );
+    // アスペクト比を固定せず、自由に四角く切り取れるようにする
+    const initialCrop = {
+      unit: '%', x: 5, y: 5, width: 90, height: 90
+    };
     setCrop(initialCrop);
+    // completedCropにもセットして、タップ前から確定状態にしておく
+    setCompletedCrop({
+      unit: 'px',
+      x: Math.round(width * 0.05),
+      y: Math.round(height * 0.05),
+      width: Math.round(width * 0.9),
+      height: Math.round(height * 0.9)
+    });
   };
 
   // --- ピクセル操作によるスキャナ(白黒)フィルタ ---
@@ -434,7 +441,7 @@ function App() {
           <p style={{ fontSize: '12px', color: '#666', margin: '0 0 15px 0' }}>写真の残したい部分を四角く囲んでください。</p>
           
           <div style={{ border: '1px solid #ddd', borderRadius: '8px', overflow: 'hidden', background: '#e0e0e0', marginBottom: '15px' }}>
-            <ReactCrop crop={crop} onChange={c => setCrop(c)} onComplete={c => setCompletedCrop(c)}>
+            <ReactCrop crop={crop} onChange={c => setCrop(c)} onComplete={c => setCompletedCrop(c)} keepSelection>
               <img ref={imgRef} src={capturedImage} alt="Crop preview" onLoad={onImageLoad} style={{ maxHeight: '50vh', display: 'block', margin: '0 auto' }} />
             </ReactCrop>
           </div>
