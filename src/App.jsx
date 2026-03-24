@@ -75,32 +75,95 @@ function App() {
 
     const imageData = ctx.getImageData(0, 0, canvasWidth, canvasHeight);
     const data = imageData.data;
-    
-    // modeに応じてコントラストと明るさを変更
-    // darkText(薄い文字モード) は、薄いグレーを黒に寄せるためコントラストを極端に上げる
+
+    // --- 影補正モード: 適応的二値化（ブロックごとに局所平均を計算して背景を均一化） ---
+    if (mode === 'shadow') {
+      // 1. まずグレースケール配列を作成
+      const w = canvasWidth;
+      const h = canvasHeight;
+      const gray = new Float32Array(w * h);
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          const idx = (y * w + x) * 4;
+          gray[y * w + x] = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
+        }
+      }
+
+      // 2. 積分画像 (Integral Image) を構築して、任意のブロックの平均を高速に計算する
+      const integral = new Float64Array(w * h);
+      for (let y = 0; y < h; y++) {
+        let rowSum = 0;
+        for (let x = 0; x < w; x++) {
+          rowSum += gray[y * w + x];
+          integral[y * w + x] = rowSum + (y > 0 ? integral[(y - 1) * w + x] : 0);
+        }
+      }
+
+      // ブロックの半径（大きいほど広い範囲の影に対応できるが処理が遅くなる）
+      const blockRadius = Math.max(Math.floor(Math.min(w, h) / 16), 15);
+      // しきい値オフセット（局所平均からこの値だけ暗いピクセルを「文字」とみなす）
+      const threshOffset = 15;
+
+      for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+          // ブロック範囲（画像端をクランプ）
+          const x1 = Math.max(0, x - blockRadius);
+          const y1 = Math.max(0, y - blockRadius);
+          const x2 = Math.min(w - 1, x + blockRadius);
+          const y2 = Math.min(h - 1, y + blockRadius);
+          const count = (x2 - x1 + 1) * (y2 - y1 + 1);
+
+          // 積分画像を使ってブロック内の合計を O(1) で取得
+          let sum = integral[y2 * w + x2];
+          if (x1 > 0) sum -= integral[y2 * w + (x1 - 1)];
+          if (y1 > 0) sum -= integral[(y1 - 1) * w + x2];
+          if (x1 > 0 && y1 > 0) sum += integral[(y1 - 1) * w + (x1 - 1)];
+
+          const localMean = sum / count;
+          const pixelGray = gray[y * w + x];
+          
+          // 局所平均より暗い → 文字部分（黒で強調）、そうでなければ背景（白）
+          // ソフト版で、完全に0か255にせず、中間の黒さも残す
+          let color;
+          if (pixelGray < localMean - threshOffset) {
+            // 文字部分のトーンを保持しつつ黒くする
+            const ratio = (localMean - pixelGray) / localMean;
+            color = Math.max(0, Math.min(255, 255 * (1 - ratio * 2.5)));
+          } else {
+            // 背景を白に飛ばす
+            color = 255;
+          }
+
+          const idx = (y * w + x) * 4;
+          data[idx] = color;
+          data[idx + 1] = color;
+          data[idx + 2] = color;
+        }
+      }
+
+      ctx.putImageData(imageData, 0, 0);
+      return;
+    }
+
+    // --- 通常モード (scanner / darkText) ---
     const contrast = (mode === 'darkText') ? 120 : 100; 
     const factor = (259 * (contrast + 255)) / (255 * (259 - contrast));
 
     for (let i = 0; i < data.length; i += 4) {
-      // 輝度を計算 (グレースケール化)
       let gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
       
-      // 薄い文字モードの場合、全体を少し暗くシフトさせてからコントラストをかける（薄い色が黒に落ちやすくなる）
       if (mode === 'darkText') {
         gray -= 40; 
       }
 
-      // コントラスト適用
       let color = factor * (gray - 128) + 128;
       
-      // 通常の書類モードなら全体的に少し明るくして紙の背景を白に飛ばす
       if (mode === 'scanner') {
         color += 30;
       }
       
       color = Math.max(0, Math.min(255, color));
 
-      // RGBを揃える (白黒)
       data[i] = color;
       data[i + 1] = color;
       data[i + 2] = color;
@@ -356,10 +419,11 @@ function App() {
           </div>
 
           <p style={{ fontWeight: 'bold', fontSize: '14px', margin: '0 0 8px 0', textAlign: 'left' }}>画像モード選択</p>
-          <div style={{ display: 'flex', gap: '5px', marginBottom: '20px' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '5px', marginBottom: '20px' }}>
              <button onClick={() => setFilterMode('none')} style={btnStyle(filterMode === 'none', '#9E9E9E')}>🖼 原本(カラー)</button>
              <button onClick={() => setFilterMode('scanner')} style={btnStyle(filterMode === 'scanner', '#2196F3')}>📄 書類(白黒)</button>
              <button onClick={() => setFilterMode('darkText')} style={btnStyle(filterMode === 'darkText', '#607D8B')}>✏️ 薄い文字用</button>
+             <button onClick={() => setFilterMode('shadow')} style={btnStyle(filterMode === 'shadow', '#FF5722')}>📷 影補正</button>
           </div>
 
           <div style={{ display: 'flex', gap: '10px' }}>
