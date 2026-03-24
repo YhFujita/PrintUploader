@@ -1,513 +1,474 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import jsPDF from 'jspdf';
-import ReactCrop, { centerCrop, makeAspectCrop } from 'react-image-crop';
-import 'react-image-crop/dist/ReactCrop.css'; // クロップ機能のCSS
+import ReactCrop from 'react-image-crop';
+import 'react-image-crop/dist/ReactCrop.css';
 
 // --- 【設定】GASのウェブアプリURLを貼り付けてください ---
 const GAS_URL = 'https://script.google.com/macros/s/AKfycbzQgb7mJclr_yrvDCpVrjjv_V95uU6uLXGIUYpBfQxO7_gwexRr6iUy0IDs1DoduwPW/exec';
 
-function App() {
-  // アプリケーションのステップ管理 (1: 撮影, 2: 編集(クロップ), 3: 保存)
-  const [step, setStep] = useState(1);
+// ステータス定数
+const STATUS = { PENDING: 'pending', UPLOADING: 'uploading', SUCCESS: 'success', FAILED: 'failed' };
 
-  // 画像関連のステート
-  const [capturedImage, setCapturedImage] = useState(null); // オリジナル写真
-  const [processedImage, setProcessedImage] = useState(null); // 編集後の高画質写真
-  
-  // クロップ(トリミング)用のステート
+function App() {
+  // ===== 画面管理 =====
+  // 'capture' (撮影), 'crop' (トリミング), 'settings' (カテゴリ設定), 'queue' (キュー一覧)
+  const [currentView, setCurrentView] = useState('capture');
+
+  // ===== 撮影・編集用の一時ステート =====
+  const [capturedImage, setCapturedImage] = useState(null);
+  const [processedImage, setProcessedImage] = useState(null);
   const imgRef = useRef(null);
   const fileInputRef = useRef(null);
   const [crop, setCrop] = useState();
   const [completedCrop, setCompletedCrop] = useState(null);
-  
-  // フィルタ状態 ('none': そのまま, 'scanner': 白黒クッキリ, 'darkText': 薄い文字強調)
   const [filterMode, setFilterMode] = useState('scanner');
 
-  // 保存設定関連のステート
+  // ===== 保存設定（次に追加するアイテム用） =====
   const [selectedCategory, setSelectedCategory] = useState('kids');
   const [comment, setComment] = useState('');
   const [customFolder, setCustomFolder] = useState('');
-  
-  // GAS関連ステート
   const [existingFolders, setExistingFolders] = useState([]);
   const [isFetchingFolders, setIsFetchingFolders] = useState(false);
-  const [status, setStatus] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
 
-  // いまの年度を計算 (日本式: 4月始まり)
+  // ===== アップロードキュー =====
+  const [uploadQueue, setUploadQueue] = useState([]); // { id, thumbnail, processedImage, category, customFolder, comment, status, error }
+  const [isUploading, setIsUploading] = useState(false);
+  const isUploadingRef = useRef(false); // useEffect内で最新の状態を参照するためのRef
+
+  const [status, setStatus] = useState('');
+
+  // 年度計算 (日本式: 4月始まり)
   const getFiscalYear = () => {
     const d = new Date();
-    const currentYear = d.getFullYear();
-    const currentMonth = d.getMonth() + 1; // 1~12
-    if (currentMonth >= 1 && currentMonth <= 3) return `${currentYear - 1}年度`;
-    return `${currentYear}年度`;
+    const y = d.getFullYear();
+    const m = d.getMonth() + 1;
+    return (m >= 1 && m <= 3) ? `${y - 1}年度` : `${y}年度`;
   };
 
-  // --- ステップ1: カメラで撮影 ---
+  // ===== ステップ1: カメラで撮影 =====
   const handleCapture = (event) => {
     const file = event.target.files[0];
     if (!file) return;
-
-    setStatus('読み込み中...');
     const reader = new FileReader();
     reader.onload = (e) => {
       setCapturedImage(e.target.result);
-      setStep(2); // 編集ステップへ
-      setStatus('');
+      setCurrentView('crop');
     };
     reader.readAsDataURL(file);
+    // inputをリセットして同じファイルを再選択可能にする
+    event.target.value = '';
   };
 
-  // クロップ枠の初期化（画像が読み込まれた時）
+  // クロップ枠の初期化
   const onImageLoad = (e) => {
     const { width, height } = e.currentTarget;
-    // アスペクト比を固定せず、自由に四角く切り取れるようにする
-    const initialCrop = {
-      unit: '%', x: 5, y: 5, width: 90, height: 90
-    };
+    const initialCrop = { unit: '%', x: 5, y: 5, width: 90, height: 90 };
     setCrop(initialCrop);
-    // completedCropにもセットして、タップ前から確定状態にしておく
     setCompletedCrop({
       unit: 'px',
-      x: Math.round(width * 0.05),
-      y: Math.round(height * 0.05),
-      width: Math.round(width * 0.9),
-      height: Math.round(height * 0.9)
+      x: Math.round(width * 0.05), y: Math.round(height * 0.05),
+      width: Math.round(width * 0.9), height: Math.round(height * 0.9)
     });
   };
 
-  // --- ピクセル操作によるスキャナ(白黒)フィルタ ---
-  const applyScannerFilter = (ctx, canvasWidth, canvasHeight, mode) => {
-    if (mode === 'none') return; // そのまま
-
-    const imageData = ctx.getImageData(0, 0, canvasWidth, canvasHeight);
+  // ===== フィルタ処理 =====
+  const applyScannerFilter = (ctx, w, h, mode) => {
+    if (mode === 'none') return;
+    const imageData = ctx.getImageData(0, 0, w, h);
     const data = imageData.data;
 
-    // --- 影補正モード: 適応的二値化（ブロックごとに局所平均を計算して背景を均一化） ---
     if (mode === 'shadow') {
-      // 1. まずグレースケール配列を作成
-      const w = canvasWidth;
-      const h = canvasHeight;
       const gray = new Float32Array(w * h);
-      for (let y = 0; y < h; y++) {
-        for (let x = 0; x < w; x++) {
-          const idx = (y * w + x) * 4;
-          gray[y * w + x] = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
-        }
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        const idx = (y * w + x) * 4;
+        gray[y * w + x] = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
       }
-
-      // 2. 積分画像 (Integral Image) を構築して、任意のブロックの平均を高速に計算する
       const integral = new Float64Array(w * h);
-      for (let y = 0; y < h; y++) {
-        let rowSum = 0;
-        for (let x = 0; x < w; x++) {
-          rowSum += gray[y * w + x];
-          integral[y * w + x] = rowSum + (y > 0 ? integral[(y - 1) * w + x] : 0);
-        }
+      for (let y = 0; y < h; y++) { let rs = 0; for (let x = 0; x < w; x++) { rs += gray[y * w + x]; integral[y * w + x] = rs + (y > 0 ? integral[(y - 1) * w + x] : 0); } }
+      const bR = Math.max(Math.floor(Math.min(w, h) / 16), 15);
+      for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+        const x1 = Math.max(0, x - bR), y1 = Math.max(0, y - bR), x2 = Math.min(w - 1, x + bR), y2 = Math.min(h - 1, y + bR);
+        const cnt = (x2 - x1 + 1) * (y2 - y1 + 1);
+        let sum = integral[y2 * w + x2]; if (x1 > 0) sum -= integral[y2 * w + (x1 - 1)]; if (y1 > 0) sum -= integral[(y1 - 1) * w + x2]; if (x1 > 0 && y1 > 0) sum += integral[(y1 - 1) * w + (x1 - 1)];
+        const lm = sum / cnt, pg = gray[y * w + x];
+        let c = 255; if (pg < lm - 15) { c = Math.max(0, Math.min(255, 255 * (1 - ((lm - pg) / lm) * 2.5))); }
+        const idx = (y * w + x) * 4; data[idx] = c; data[idx + 1] = c; data[idx + 2] = c;
       }
-
-      // ブロックの半径（大きいほど広い範囲の影に対応できるが処理が遅くなる）
-      const blockRadius = Math.max(Math.floor(Math.min(w, h) / 16), 15);
-      // しきい値オフセット（局所平均からこの値だけ暗いピクセルを「文字」とみなす）
-      const threshOffset = 15;
-
-      for (let y = 0; y < h; y++) {
-        for (let x = 0; x < w; x++) {
-          // ブロック範囲（画像端をクランプ）
-          const x1 = Math.max(0, x - blockRadius);
-          const y1 = Math.max(0, y - blockRadius);
-          const x2 = Math.min(w - 1, x + blockRadius);
-          const y2 = Math.min(h - 1, y + blockRadius);
-          const count = (x2 - x1 + 1) * (y2 - y1 + 1);
-
-          // 積分画像を使ってブロック内の合計を O(1) で取得
-          let sum = integral[y2 * w + x2];
-          if (x1 > 0) sum -= integral[y2 * w + (x1 - 1)];
-          if (y1 > 0) sum -= integral[(y1 - 1) * w + x2];
-          if (x1 > 0 && y1 > 0) sum += integral[(y1 - 1) * w + (x1 - 1)];
-
-          const localMean = sum / count;
-          const pixelGray = gray[y * w + x];
-          
-          // 局所平均より暗い → 文字部分（黒で強調）、そうでなければ背景（白）
-          // ソフト版で、完全に0か255にせず、中間の黒さも残す
-          let color;
-          if (pixelGray < localMean - threshOffset) {
-            // 文字部分のトーンを保持しつつ黒くする
-            const ratio = (localMean - pixelGray) / localMean;
-            color = Math.max(0, Math.min(255, 255 * (1 - ratio * 2.5)));
-          } else {
-            // 背景を白に飛ばす
-            color = 255;
-          }
-
-          const idx = (y * w + x) * 4;
-          data[idx] = color;
-          data[idx + 1] = color;
-          data[idx + 2] = color;
-        }
-      }
-
-      ctx.putImageData(imageData, 0, 0);
-      return;
+      ctx.putImageData(imageData, 0, 0); return;
     }
 
-    // --- 通常モード (scanner / darkText) ---
-    const contrast = (mode === 'darkText') ? 120 : 100; 
+    const contrast = (mode === 'darkText') ? 120 : 100;
     const factor = (259 * (contrast + 255)) / (255 * (259 - contrast));
-
     for (let i = 0; i < data.length; i += 4) {
-      let gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-      
-      if (mode === 'darkText') {
-        gray -= 40; 
-      }
-
-      let color = factor * (gray - 128) + 128;
-      
-      if (mode === 'scanner') {
-        color += 30;
-      }
-      
-      color = Math.max(0, Math.min(255, color));
-
-      data[i] = color;
-      data[i + 1] = color;
-      data[i + 2] = color;
+      let g = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+      if (mode === 'darkText') g -= 40;
+      let c = factor * (g - 128) + 128;
+      if (mode === 'scanner') c += 30;
+      c = Math.max(0, Math.min(255, c));
+      data[i] = c; data[i + 1] = c; data[i + 2] = c;
     }
     ctx.putImageData(imageData, 0, 0);
   };
 
-  // --- ステップ2: トリミング・フィルタの実行 ---
+  // ===== トリミング・フィルタの実行 =====
   const applyCropAndFilter = async () => {
     const image = imgRef.current;
-    if (!image || !completedCrop?.width || !completedCrop?.height) {
-      // クロップ操作を一切せずに進もうとした場合、全体を対象にする
-      if (image) {
-        setCompletedCrop({
-          x: 0, y: 0, width: image.width, height: image.height, unit: 'px'
-        });
-      } else {
-        return;
-      }
-    }
+    if (!image) return;
+    const cc = completedCrop || { x: 0, y: 0, width: image.width, height: image.height, unit: 'px' };
 
     const canvas = document.createElement('canvas');
-    const scaleX = image.naturalWidth / image.width;
-    const scaleY = image.naturalHeight / image.height;
-    
-    // クロップされた実際のリアルピクセルサイズ
-    const targetWidth = Math.floor((completedCrop?.width || image.width) * scaleX);
-    const targetHeight = Math.floor((completedCrop?.height || image.height) * scaleY);
-
-    // **この段階では解像度を落とさず、クロップと白黒化のみを原寸で行う**
-    canvas.width = targetWidth;
-    canvas.height = targetHeight;
+    const sx = image.naturalWidth / image.width, sy = image.naturalHeight / image.height;
+    const tw = Math.floor(cc.width * sx), th = Math.floor(cc.height * sy);
+    canvas.width = tw; canvas.height = th;
     const ctx = canvas.getContext('2d');
+    ctx.drawImage(image, cc.x * sx, cc.y * sy, tw, th, 0, 0, tw, th);
+    applyScannerFilter(ctx, tw, th, filterMode);
 
-    // クロップ対象を描画
-    ctx.drawImage(
-      image,
-      (completedCrop?.x || 0) * scaleX,
-      (completedCrop?.y || 0) * scaleY,
-      targetWidth,
-      targetHeight,
-      0,
-      0,
-      targetWidth,
-      targetHeight
-    );
-
-    // 選択されたフィルタモード（書類、薄い文字など）をかける
-    applyScannerFilter(ctx, targetWidth, targetHeight, filterMode);
-
-    // プレビュー用に一時保持する（0.9画質で少し容量を抑えつつキレイに保つ）
-    const base64Image = canvas.toDataURL('image/jpeg', 0.9);
-    setProcessedImage(base64Image);
-    
-    // ステップ3に進み、初期カテゴリのフォルダ一覧を取得しておく
-    setStep(3);
+    const base64 = canvas.toDataURL('image/jpeg', 0.9);
+    setProcessedImage(base64);
+    setCurrentView('settings');
     fetchExistingFolders(selectedCategory);
-    setStatus('カテゴリと保存先を選んでアップロードします。');
   };
 
-  // --- GASへ既存サブフォルダ一覧を取得しにいく ---
+  // ===== GASフォルダ一覧取得 =====
   const fetchExistingFolders = async (category) => {
-    if (GAS_URL === 'ここにGASのデプロイURLを貼り付けてください' || !GAS_URL) return;
+    if (!GAS_URL) return;
     setIsFetchingFolders(true);
-    setStatus('作成済みのフォルダを検索中...');
     try {
-      const response = await fetch(GAS_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain' },
-        body: JSON.stringify({ action: 'getFolders', category: category, year: getFiscalYear() })
-      });
-      const data = await response.json();
-      if (data.success) {
-        setExistingFolders(data.folders || []);
-        setStatus('準備完了。保存先を設定してください。');
-      } else {
-        setStatus(`⚠ フォルダリストの取得に失敗: ${data.error}`);
-      }
-    } catch (error) {
-      setStatus(`⚠ ネットワークエラー`);
-    } finally {
-      setIsFetchingFolders(false);
-    }
+      const res = await fetch(GAS_URL, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: JSON.stringify({ action: 'getFolders', category, year: getFiscalYear() }) });
+      const d = await res.json();
+      if (d.success) setExistingFolders(d.folders || []);
+    } catch (e) { /* エラー時は空のまま */ }
+    finally { setIsFetchingFolders(false); }
   };
 
   const handleCategoryChange = (category) => {
     setSelectedCategory(category);
-    setCustomFolder(''); 
+    setCustomFolder('');
     setExistingFolders([]);
     fetchExistingFolders(category);
-    
-    // カテゴリが子供写真以外の場合、スキャナモードを自動的にONにする（おすすめ）
-    if (category !== 'kids') {
-      setFilterMode('scanner');
-    } else {
-      setFilterMode('none');
-    }
+    if (category !== 'kids') setFilterMode('scanner'); else setFilterMode('none');
   };
 
-  // --- JPG保存時にのみ画像を圧縮・リサイズするロジック ---
-  const compressToJpegBase64 = async (imageSrc, maxSize = 1200, quality = 0.85) => {
-    return new Promise((resolve) => {
-      const img = new Image();
-      img.onload = () => {
-        const canvas = document.createElement('canvas');
-        let width = img.width;
-        let height = img.height;
-        if (width > height) {
-          if (width > maxSize) { height = Math.round(height * (maxSize / width)); width = maxSize; }
-        } else {
-          if (height > maxSize) { width = Math.round(width * (maxSize / height)); height = maxSize; }
-        }
-        canvas.width = width; canvas.height = height;
-        const ctx = canvas.getContext('2d');
-        ctx.drawImage(img, 0, 0, width, height);
-        resolve(canvas.toDataURL('image/jpeg', quality));
+  // ===== キューに画像を追加 =====
+  const addToQueue = () => {
+    if (!processedImage) return;
+    // サムネイルは小さく作る（メモリ節約のため）
+    const thumbCanvas = document.createElement('canvas');
+    const thumbImg = new Image();
+    thumbImg.onload = () => {
+      const maxThumb = 150;
+      let w = thumbImg.width, h = thumbImg.height;
+      if (w > h) { if (w > maxThumb) { h = Math.round(h * (maxThumb / w)); w = maxThumb; } }
+      else { if (h > maxThumb) { w = Math.round(w * (maxThumb / h)); h = maxThumb; } }
+      thumbCanvas.width = w; thumbCanvas.height = h;
+      thumbCanvas.getContext('2d').drawImage(thumbImg, 0, 0, w, h);
+      const thumbnail = thumbCanvas.toDataURL('image/jpeg', 0.6);
+
+      const newItem = {
+        id: Date.now().toString() + Math.random().toString(36).substr(2, 5),
+        thumbnail,
+        processedImage,
+        category: selectedCategory,
+        customFolder,
+        comment,
+        filterMode,
+        status: STATUS.PENDING,
+        error: null
       };
-      img.src = imageSrc;
-    });
+      setUploadQueue(prev => [...prev, newItem]);
+
+      // リセットして次の撮影へ
+      setCapturedImage(null);
+      setProcessedImage(null);
+      setComment('');
+      setCurrentView('capture');
+      setStatus(`✅ キューに追加しました（合計 ${uploadQueue.length + 1} 枚）`);
+      setTimeout(() => setStatus(''), 2000);
+    };
+    thumbImg.src = processedImage;
   };
 
-  // --- PDFとしてBase64化するロジック (適度にリサイズして容量を削減) ---
-  const getPdfBase64 = async (imageSrc) => {
-    return new Promise((resolve) => {
-      const img = new Image();
-      img.onload = () => {
-        // まず画像を適度なサイズに縮小してJPEG圧縮する（PDF容量削減の核心部分）
-        const compressCanvas = document.createElement('canvas');
-        const PDF_MAX_SIZE = 1600; // 長辺1600pxあればA4印刷でも十分きれい
-        const PDF_QUALITY = 0.65;  // JPEG品質65%（白黒文書なら劣化はほぼ目立たない）
-        let cw = img.width;
-        let ch = img.height;
-        if (cw > ch) {
-          if (cw > PDF_MAX_SIZE) { ch = Math.round(ch * (PDF_MAX_SIZE / cw)); cw = PDF_MAX_SIZE; }
-        } else {
-          if (ch > PDF_MAX_SIZE) { cw = Math.round(cw * (PDF_MAX_SIZE / ch)); ch = PDF_MAX_SIZE; }
-        }
-        compressCanvas.width = cw;
-        compressCanvas.height = ch;
-        const cctx = compressCanvas.getContext('2d');
-        cctx.drawImage(img, 0, 0, cw, ch);
-        // 圧縮済みの画像をData URL化
-        const compressedSrc = compressCanvas.toDataURL('image/jpeg', PDF_QUALITY);
-
-        // 圧縮済み画像をPDFのA4枠に貼り付ける
-        const pdfImg = new Image();
-        pdfImg.onload = () => {
-          const doc = new jsPDF();
-          const pageWidth = doc.internal.pageSize.getWidth();
-          const pageHeight = doc.internal.pageSize.getHeight();
-          const margin = 10;
-          const targetWidth = pageWidth - (margin * 2);
-
-          let imgWidth = pdfImg.width; let imgHeight = pdfImg.height;
-          let finalWidth = targetWidth; let finalHeight = (imgHeight * finalWidth) / imgWidth;
-
-          if (finalHeight > (pageHeight - margin * 2)) {
-            finalHeight = pageHeight - (margin * 2); finalWidth = (imgWidth * finalHeight) / imgHeight;
-          }
-          doc.addImage(pdfImg, 'JPEG', (pageWidth - finalWidth) / 2, margin, finalWidth, finalHeight);
-          resolve(doc.output('datauristring'));
-        };
-        pdfImg.src = compressedSrc;
-      };
-      img.src = imageSrc;
-    });
+  // ===== キューから個別削除 =====
+  const removeFromQueue = (id) => {
+    setUploadQueue(prev => prev.filter(item => item.id !== id));
   };
 
-  // --- 最終保存処理 ---
-  const handleSave = async () => {
-    if (!processedImage) {
-      setStatus('画像が正しく処理されていません。');
-      return;
-    }
-    if (GAS_URL === 'ここにGASのデプロイURLを貼り付けてください' || !GAS_URL) return;
-
-    setIsLoading(true);
-    setStatus('クラウドに保存中...');
-
-    try {
-      let fileData;
-      let filename;
-      const timestamp = new Date().toLocaleString('ja-JP').replace(/[\/\s:]/g, '');
-
-      // カテゴリーに応じたデータ作成 (PDFかJPEGか)
-      if (selectedCategory === 'kids') {
-        // 子供写真(JPG)の時だけ、アップロード前に圧縮して容量削減する（最大長辺1200px）
-        fileData = await compressToJpegBase64(processedImage, 1200, 0.85);
-        filename = `子供写真_${timestamp}.jpg`;
-      } else {
-        // 書類系(PDF)の時は、高解像度のままPDFにして文字潰れを防ぐ
-        fileData = await getPdfBase64(processedImage);
-        let prefix = '書類';
-        if (selectedCategory === 'receipt') prefix = '領収証';
-        if (selectedCategory === 'payslip') prefix = '給与明細';
-        if (selectedCategory === 'important') prefix = '重要書類';
-        filename = `${prefix}_${timestamp}.pdf`;
-      }
-
-      const response = await fetch(GAS_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain' },
-        body: JSON.stringify({
-          action: 'save',
-          category: selectedCategory,
-          fileData: fileData,
-          filename: filename,
-          comment: comment,
-          year: getFiscalYear(),
-          customFolder: customFolder
-        })
-      });
-
-      const responseData = await response.json();
-
-      if (responseData.success) {
-        setStatus(`✅ 保存完了！`);
-        // 全てリセットして最初の画面へ戻る
-        setTimeout(() => {
-          setCapturedImage(null);
-          setProcessedImage(null);
-          setComment('');
-          setCustomFolder('');
-          setStatus('');
-          setStep(1);
-        }, 3000);
-      } else {
-        setStatus(`❌ エラー: ${responseData.error}`);
-      }
-
-    } catch (error) {
-      setStatus(`❌ 予期せぬエラー: ${error.message}`);
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  // ------------------------------------------------------------------
-  // UI 表示部分
-  // ------------------------------------------------------------------
-  const btnStyle = (selected, color) => ({
-    background: selected ? color : '#f0f0f0',
-    color: selected ? 'white' : '#333',
-    padding: '12px 10px', border: selected ? '1px solid '+color : '1px solid #ddd',
-    borderRadius: '8px', cursor: 'pointer', fontWeight: selected ? 'bold' : 'normal',
-    transition: '0.2s', fontSize: '14px', flex: 1
+  // ===== 画像圧縮ユーティリティ =====
+  const compressToJpeg = (imageSrc, maxSize, quality) => new Promise((resolve) => {
+    const img = new Image(); img.onload = () => {
+      const c = document.createElement('canvas'); let w = img.width, h = img.height;
+      if (w > h) { if (w > maxSize) { h = Math.round(h * (maxSize / w)); w = maxSize; } }
+      else { if (h > maxSize) { w = Math.round(w * (maxSize / h)); h = maxSize; } }
+      c.width = w; c.height = h; c.getContext('2d').drawImage(img, 0, 0, w, h);
+      resolve(c.toDataURL('image/jpeg', quality));
+    }; img.src = imageSrc;
   });
+
+  const toPdfBase64 = (imageSrc) => new Promise((resolve) => {
+    const img = new Image(); img.onload = () => {
+      const cc = document.createElement('canvas'); let w = img.width, h = img.height;
+      const mx = 1600; const q = 0.65;
+      if (w > h) { if (w > mx) { h = Math.round(h * (mx / w)); w = mx; } } else { if (h > mx) { w = Math.round(w * (mx / h)); h = mx; } }
+      cc.width = w; cc.height = h; cc.getContext('2d').drawImage(img, 0, 0, w, h);
+      const compressed = cc.toDataURL('image/jpeg', q);
+      const pi = new Image(); pi.onload = () => {
+        const doc = new jsPDF(); const pw = doc.internal.pageSize.getWidth(), ph = doc.internal.pageSize.getHeight(), m = 10;
+        let fw = pw - m * 2, fh = (pi.height * fw) / pi.width;
+        if (fh > ph - m * 2) { fh = ph - m * 2; fw = (pi.width * fh) / pi.height; }
+        doc.addImage(pi, 'JPEG', (pw - fw) / 2, m, fw, fh);
+        resolve(doc.output('datauristring'));
+      }; pi.src = compressed;
+    }; img.src = imageSrc;
+  });
+
+  // ===== 単一アイテムのアップロード処理 =====
+  const uploadSingleItem = async (item) => {
+    let fileData, filename;
+    const ts = new Date().toLocaleString('ja-JP').replace(/[\/\s:]/g, '');
+
+    if (item.category === 'kids') {
+      fileData = await compressToJpeg(item.processedImage, 1200, 0.85);
+      filename = `子供写真_${ts}.jpg`;
+    } else {
+      fileData = await toPdfBase64(item.processedImage);
+      const prefixes = { receipt: '領収証', payslip: '給与明細', important: '重要書類' };
+      filename = `${prefixes[item.category] || '書類'}_${ts}.pdf`;
+    }
+
+    const res = await fetch(GAS_URL, {
+      method: 'POST', headers: { 'Content-Type': 'text/plain' },
+      body: JSON.stringify({ action: 'save', category: item.category, fileData, filename, comment: item.comment, year: getFiscalYear(), customFolder: item.customFolder })
+    });
+    const data = await res.json();
+    if (!data.success) throw new Error(data.error || '保存に失敗しました');
+    return data;
+  };
+
+  // ===== キュー内の全てのpending/failedアイテムを順次アップロード =====
+  const processQueue = useCallback(async () => {
+    if (isUploadingRef.current) return;
+    isUploadingRef.current = true;
+    setIsUploading(true);
+
+    // pending または failed を対象にする
+    const itemsToUpload = uploadQueue.filter(i => i.status === STATUS.PENDING || i.status === STATUS.FAILED);
+
+    for (const item of itemsToUpload) {
+      // ステータスを「uploading」に変更
+      setUploadQueue(prev => prev.map(i => i.id === item.id ? { ...i, status: STATUS.UPLOADING, error: null } : i));
+      
+      try {
+        await uploadSingleItem(item);
+        setUploadQueue(prev => prev.map(i => i.id === item.id ? { ...i, status: STATUS.SUCCESS, processedImage: null } : i));
+      } catch (error) {
+        setUploadQueue(prev => prev.map(i => i.id === item.id ? { ...i, status: STATUS.FAILED, error: error.message } : i));
+      }
+
+      // 少し待ってからGASへの負荷を分散する
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    isUploadingRef.current = false;
+    setIsUploading(false);
+  }, [uploadQueue]);
+
+  // ===== 完了済みアイテムを一括削除 =====
+  const clearCompleted = () => {
+    setUploadQueue(prev => prev.filter(i => i.status !== STATUS.SUCCESS));
+  };
+
+  // ===== 失敗した画像だけ再アップロード =====
+  const retryFailed = () => {
+    setUploadQueue(prev => prev.map(i => i.status === STATUS.FAILED ? { ...i, status: STATUS.PENDING, error: null } : i));
+  };
+
+  // キュー状態の集計
+  const queueCounts = {
+    total: uploadQueue.length,
+    pending: uploadQueue.filter(i => i.status === STATUS.PENDING).length,
+    uploading: uploadQueue.filter(i => i.status === STATUS.UPLOADING).length,
+    success: uploadQueue.filter(i => i.status === STATUS.SUCCESS).length,
+    failed: uploadQueue.filter(i => i.status === STATUS.FAILED).length,
+  };
+
+  // ===== UI =====
+  const btnStyle = (selected, color) => ({
+    background: selected ? color : '#f0f0f0', color: selected ? 'white' : '#333',
+    padding: '12px 10px', border: selected ? '1px solid ' + color : '1px solid #ddd',
+    borderRadius: '8px', cursor: 'pointer', fontWeight: selected ? 'bold' : 'normal',
+    transition: '0.2s', fontSize: '14px'
+  });
+
+  const statusColor = (s) => {
+    if (s === STATUS.SUCCESS) return '#4CAF50';
+    if (s === STATUS.FAILED) return '#f44336';
+    if (s === STATUS.UPLOADING) return '#2196F3';
+    return '#999';
+  };
+  const statusIcon = (s) => {
+    if (s === STATUS.SUCCESS) return '✅';
+    if (s === STATUS.FAILED) return '❌';
+    if (s === STATUS.UPLOADING) return '⏳';
+    return '🕐';
+  };
+
+  const categoryLabel = (c) => {
+    if (c === 'kids') return '🎨子供'; if (c === 'receipt') return '🧾領収';
+    if (c === 'payslip') return '💰給与'; if (c === 'important') return '🚨重要';
+    return c;
+  };
 
   return (
     <div style={{ padding: '15px', textAlign: 'center', fontFamily: 'sans-serif', maxWidth: '500px', margin: '0 auto' }}>
       <h2 style={{ marginBottom: '5px' }}>PrintUploader</h2>
-      <p style={{ color: '#666', fontSize: '13px', marginTop: '0', marginBottom: '15px' }}>{getFiscalYear()} 保存受付中</p>
+      <p style={{ color: '#666', fontSize: '13px', marginTop: '0', marginBottom: '10px' }}>{getFiscalYear()} 保存受付中</p>
 
-      {/* -------------------- ステップ1: 撮影 -------------------- */}
-      {step === 1 && (
-        <div style={{ marginTop: '30px' }}>
+      {/* ====== キューバッジ（常時表示） ====== */}
+      {uploadQueue.length > 0 && (
+        <div
+          onClick={() => setCurrentView('queue')}
+          style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', background: isUploading ? '#E3F2FD' : '#FFF3E0', padding: '8px 16px', borderRadius: '20px', border: `1px solid ${isUploading ? '#90CAF9' : '#FFE0B2'}`, cursor: 'pointer', marginBottom: '10px', fontSize: '14px' }}
+        >
+          {isUploading && <span style={{ animation: 'spin 1s linear infinite', display: 'inline-block' }}>⏳</span>}
+          <span>📋 キュー: {queueCounts.pending > 0 && `${queueCounts.pending}待ち `}{queueCounts.uploading > 0 && `${queueCounts.uploading}送信中 `}{queueCounts.success > 0 && `${queueCounts.success}完了 `}{queueCounts.failed > 0 && <span style={{ color: '#f44336' }}>{queueCounts.failed}失敗</span>}</span>
+        </div>
+      )}
+
+      {/* ====== 撮影画面 ====== */}
+      {currentView === 'capture' && (
+        <div style={{ marginTop: '20px' }}>
           <input type="file" accept="image/*" capture="environment" ref={fileInputRef} onChange={handleCapture} style={{ display: 'none' }} />
-          <button onClick={() => fileInputRef.current.click()} disabled={isLoading} style={{ width: '100%', padding: '20px', fontSize: '18px', background: '#333', color: 'white', border: 'none', borderRadius: '12px', cursor: 'pointer', boxShadow: '0 4px 6px rgba(0,0,0,0.2)' }}>
+          <button onClick={() => fileInputRef.current.click()} style={{ width: '100%', padding: '20px', fontSize: '18px', background: '#333', color: 'white', border: 'none', borderRadius: '12px', cursor: 'pointer', boxShadow: '0 4px 6px rgba(0,0,0,0.2)' }}>
             📸 写真を撮る / 選ぶ
           </button>
+
+          {uploadQueue.length > 0 && (
+            <button onClick={() => setCurrentView('queue')} style={{ width: '100%', marginTop: '15px', padding: '15px', fontSize: '16px', background: '#FF9800', color: 'white', border: 'none', borderRadius: '12px', cursor: 'pointer' }}>
+              📋 キュー一覧を見る ({uploadQueue.length}枚)
+            </button>
+          )}
         </div>
       )}
 
-      {/* -------------------- ステップ2: トリミング・編集 -------------------- */}
-      {step === 2 && capturedImage && (
+      {/* ====== トリミング画面 ====== */}
+      {currentView === 'crop' && capturedImage && (
         <div style={{ background: '#f9f9f9', padding: '15px', borderRadius: '12px', boxShadow: '0 2px 5px rgba(0,0,0,0.1)' }}>
           <p style={{ fontWeight: 'bold', margin: '0 0 10px 0' }}>画像のトリミング・調整</p>
-          <p style={{ fontSize: '12px', color: '#666', margin: '0 0 15px 0' }}>写真の残したい部分を四角く囲んでください。</p>
-          
           <div style={{ border: '1px solid #ddd', borderRadius: '8px', overflow: 'hidden', background: '#e0e0e0', marginBottom: '15px' }}>
             <ReactCrop crop={crop} onChange={c => setCrop(c)} onComplete={c => setCompletedCrop(c)} keepSelection>
-              <img ref={imgRef} src={capturedImage} alt="Crop preview" onLoad={onImageLoad} style={{ maxHeight: '50vh', display: 'block', margin: '0 auto' }} />
+              <img ref={imgRef} src={capturedImage} alt="Crop" onLoad={onImageLoad} style={{ maxHeight: '50vh', display: 'block', margin: '0 auto' }} />
             </ReactCrop>
           </div>
-
-          <p style={{ fontWeight: 'bold', fontSize: '14px', margin: '0 0 8px 0', textAlign: 'left' }}>画像モード選択</p>
+          <p style={{ fontWeight: 'bold', fontSize: '14px', margin: '0 0 8px 0', textAlign: 'left' }}>画像モード</p>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '5px', marginBottom: '20px' }}>
-             <button onClick={() => setFilterMode('none')} style={btnStyle(filterMode === 'none', '#9E9E9E')}>🖼 原本(カラー)</button>
-             <button onClick={() => setFilterMode('scanner')} style={btnStyle(filterMode === 'scanner', '#2196F3')}>📄 書類(白黒)</button>
-             <button onClick={() => setFilterMode('darkText')} style={btnStyle(filterMode === 'darkText', '#607D8B')}>✏️ 薄い文字用</button>
-             <button onClick={() => setFilterMode('shadow')} style={btnStyle(filterMode === 'shadow', '#FF5722')}>📷 影補正</button>
+            <button onClick={() => setFilterMode('none')} style={btnStyle(filterMode === 'none', '#9E9E9E')}>🖼 原本</button>
+            <button onClick={() => setFilterMode('scanner')} style={btnStyle(filterMode === 'scanner', '#2196F3')}>📄 書類</button>
+            <button onClick={() => setFilterMode('darkText')} style={btnStyle(filterMode === 'darkText', '#607D8B')}>✏️ 薄文字</button>
+            <button onClick={() => setFilterMode('shadow')} style={btnStyle(filterMode === 'shadow', '#FF5722')}>📷 影補正</button>
           </div>
-
           <div style={{ display: 'flex', gap: '10px' }}>
-            <button onClick={() => setStep(1)} style={{ flex: 1, padding: '12px', background: '#ccc', border: 'none', borderRadius: '8px', cursor: 'pointer' }}>やり直す</button>
-            <button onClick={applyCropAndFilter} style={{ flex: 2, padding: '12px', background: '#4CAF50', color: 'white', fontWeight: 'bold', border: 'none', borderRadius: '8px', cursor: 'pointer' }}>この画像で決定 →</button>
+            <button onClick={() => { setCapturedImage(null); setCurrentView('capture'); }} style={{ flex: 1, padding: '12px', background: '#ccc', border: 'none', borderRadius: '8px', cursor: 'pointer' }}>やり直す</button>
+            <button onClick={applyCropAndFilter} style={{ flex: 2, padding: '12px', background: '#4CAF50', color: 'white', fontWeight: 'bold', border: 'none', borderRadius: '8px', cursor: 'pointer' }}>決定 →</button>
           </div>
         </div>
       )}
 
-      {/* -------------------- ステップ3: 保存先設定 -------------------- */}
-      {step === 3 && processedImage && (
+      {/* ====== カテゴリ・保存設定画面 ====== */}
+      {currentView === 'settings' && processedImage && (
         <div style={{ background: '#f9f9f9', padding: '15px', borderRadius: '12px', boxShadow: '0 2px 5px rgba(0,0,0,0.1)', textAlign: 'left' }}>
-          
-          {/* ミニプレビュー */}
-          <div style={{ background: '#eee', padding: '5px', borderRadius: '8px', marginBottom: '20px', textAlign: 'center' }}>
-            <img src={processedImage} alt="Processed" style={{ maxHeight: '150px', borderRadius: '4px', border: '1px solid #ccc' }} />
-            <br />
-            <button onClick={() => setStep(2)} style={{ marginTop: '5px', fontSize: '12px', padding: '5px 10px', background: '#ccc', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>✂ 画像を再編集する</button>
+          <div style={{ background: '#eee', padding: '5px', borderRadius: '8px', marginBottom: '15px', textAlign: 'center' }}>
+            <img src={processedImage} alt="Preview" style={{ maxHeight: '120px', borderRadius: '4px', border: '1px solid #ccc' }} />
+            <br /><button onClick={() => setCurrentView('crop')} style={{ marginTop: '5px', fontSize: '12px', padding: '4px 10px', background: '#ccc', border: 'none', borderRadius: '4px', cursor: 'pointer' }}>✂ 再編集</button>
           </div>
 
-          <p style={{ fontWeight: 'bold', margin: '0 0 10px 0', borderBottom: '2px solid #ddd', paddingBottom: '5px' }}>1. 保存カテゴリ</p>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', marginBottom: '20px' }}>
-            <button onClick={() => handleCategoryChange('kids')} disabled={isLoading} style={btnStyle(selectedCategory === 'kids', '#4CAF50')}>🎨 子供作品</button>
-            <button onClick={() => handleCategoryChange('receipt')} disabled={isLoading} style={btnStyle(selectedCategory === 'receipt', '#FF9800')}>🧾 領収証</button>
-            <button onClick={() => handleCategoryChange('payslip')} disabled={isLoading} style={btnStyle(selectedCategory === 'payslip', '#2196F3')}>💰 給与明細</button>
-            <button onClick={() => handleCategoryChange('important')} disabled={isLoading} style={btnStyle(selectedCategory === 'important', '#E91E63')}>🚨 重要書類</button>
+          <p style={{ fontWeight: 'bold', margin: '0 0 8px 0', borderBottom: '2px solid #ddd', paddingBottom: '5px' }}>1. カテゴリ</p>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px', marginBottom: '15px' }}>
+            <button onClick={() => handleCategoryChange('kids')} style={btnStyle(selectedCategory === 'kids', '#4CAF50')}>🎨 子供作品</button>
+            <button onClick={() => handleCategoryChange('receipt')} style={btnStyle(selectedCategory === 'receipt', '#FF9800')}>🧾 領収証</button>
+            <button onClick={() => handleCategoryChange('payslip')} style={btnStyle(selectedCategory === 'payslip', '#2196F3')}>💰 給与明細</button>
+            <button onClick={() => handleCategoryChange('important')} style={btnStyle(selectedCategory === 'important', '#E91E63')}>🚨 重要書類</button>
           </div>
 
-          <p style={{ fontWeight: 'bold', margin: '0 0 10px 0', borderBottom: '2px solid #ddd', paddingBottom: '5px' }}>2. 振り分け先フォルダ</p>
-          <div style={{ background: 'white', padding: '10px', borderRadius: '8px', border: '1px solid #e0e0e0', marginBottom: '20px' }}>
-            <p style={{ fontSize: '12px', color: '#666', margin: '0 0 5px 0' }}>※年度フォルダ（{getFiscalYear()}）内に作られます。未入力も可。</p>
-            <input type="text" value={customFolder} onChange={(e) => setCustomFolder(e.target.value)} placeholder="新規作成 または 手入力..." disabled={isLoading} style={{ width: '100%', boxSizing: 'border-box', padding: '10px', borderRadius: '6px', border: '1px solid #ccc', marginBottom: '10px' }} />
-            
+          <p style={{ fontWeight: 'bold', margin: '0 0 8px 0', borderBottom: '2px solid #ddd', paddingBottom: '5px' }}>2. フォルダ</p>
+          <div style={{ background: 'white', padding: '10px', borderRadius: '8px', border: '1px solid #e0e0e0', marginBottom: '15px' }}>
+            <p style={{ fontSize: '12px', color: '#666', margin: '0 0 5px 0' }}>※{getFiscalYear()}内。未入力で直下に保存。</p>
+            <input type="text" value={customFolder} onChange={(e) => setCustomFolder(e.target.value)} placeholder="フォルダ名..." style={{ width: '100%', boxSizing: 'border-box', padding: '10px', borderRadius: '6px', border: '1px solid #ccc', marginBottom: '8px' }} />
             {existingFolders.length > 0 && (
-              <select onChange={(e) => setCustomFolder(e.target.value)} disabled={isLoading} value={customFolder} style={{ width: '100%', padding: '10px', borderRadius: '6px', border: '1px solid #ccc', background: '#f9f9f9' }}>
-                <option value="">▼ 既存のフォルダから選択</option>
-                {existingFolders.map((fName, i) => (<option key={i} value={fName}>{fName}</option>))}
+              <select onChange={(e) => setCustomFolder(e.target.value)} value={customFolder} style={{ width: '100%', padding: '10px', borderRadius: '6px', border: '1px solid #ccc', background: '#f9f9f9' }}>
+                <option value="">▼ 既存フォルダ</option>
+                {existingFolders.map((f, i) => (<option key={i} value={f}>{f}</option>))}
               </select>
             )}
-            {existingFolders.length === 0 && !isFetchingFolders && (
-               <p style={{ fontSize: '12px', color: '#888' }}>既存フォルダは見つかりませんでした。</p>
-            )}
-            {isFetchingFolders && <p style={{ fontSize: '12px', color: '#2196F3' }}>検索中...</p>}
+            {isFetchingFolders && <p style={{ fontSize: '12px', color: '#2196F3', margin: '5px 0 0' }}>検索中...</p>}
           </div>
 
-          <p style={{ fontWeight: 'bold', margin: '0 0 10px 0', borderBottom: '2px solid #ddd', paddingBottom: '5px' }}>3. 詳細メモ (任意)</p>
-          <input type="text" value={comment} onChange={(e) => setComment(e.target.value)} placeholder="内容や金額など..." disabled={isLoading} style={{ width: '100%', boxSizing: 'border-box', padding: '10px', borderRadius: '6px', border: '1px solid #ccc', marginBottom: '20px' }} />
+          <p style={{ fontWeight: 'bold', margin: '0 0 8px 0', borderBottom: '2px solid #ddd', paddingBottom: '5px' }}>3. メモ</p>
+          <input type="text" value={comment} onChange={(e) => setComment(e.target.value)} placeholder="内容メモ..." style={{ width: '100%', boxSizing: 'border-box', padding: '10px', borderRadius: '6px', border: '1px solid #ccc', marginBottom: '15px' }} />
 
-          <button onClick={handleSave} disabled={isLoading} style={{ width: '100%', padding: '18px', fontSize: '18px', background: '#4CAF50', color: 'white', border: 'none', borderRadius: '12px', cursor: 'pointer', fontWeight: 'bold', boxShadow: '0 4px 6px rgba(0,0,0,0.2)' }}>
-            {isLoading ? 'クラウドへアップロード中...' : '☁ クラウドに保存する'}
+          <button onClick={addToQueue} style={{ width: '100%', padding: '16px', fontSize: '17px', background: '#FF9800', color: 'white', border: 'none', borderRadius: '12px', cursor: 'pointer', fontWeight: 'bold', boxShadow: '0 4px 6px rgba(0,0,0,0.2)', marginBottom: '10px' }}>
+            📋 キューに追加して次を撮影
           </button>
         </div>
       )}
 
-      {/* ステータス */}
-      {status && <p style={{ marginTop: '20px', color: '#333', fontWeight: 'bold' }}>{status}</p>}
+      {/* ====== キュー一覧画面 ====== */}
+      {currentView === 'queue' && (
+        <div style={{ textAlign: 'left' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '15px' }}>
+            <p style={{ fontWeight: 'bold', fontSize: '16px', margin: 0 }}>アップロードキュー ({uploadQueue.length}枚)</p>
+            <button onClick={() => setCurrentView('capture')} style={{ padding: '8px 12px', background: '#333', color: 'white', border: 'none', borderRadius: '8px', cursor: 'pointer', fontSize: '13px' }}>📸 撮影に戻る</button>
+          </div>
+
+          {/* プログレスバー (アップロード中のみ) */}
+          {isUploading && queueCounts.total > 0 && (
+            <div style={{ background: '#e0e0e0', borderRadius: '4px', height: '8px', marginBottom: '15px', overflow: 'hidden' }}>
+              <div style={{ background: '#4CAF50', height: '100%', width: `${(queueCounts.success / queueCounts.total) * 100}%`, transition: '0.3s' }} />
+            </div>
+          )}
+
+          {/* アイテム一覧 */}
+          {uploadQueue.length === 0 && <p style={{ textAlign: 'center', color: '#888' }}>キューは空です。撮影してください。</p>}
+          {uploadQueue.map((item) => (
+            <div key={item.id} style={{ display: 'flex', gap: '10px', alignItems: 'center', padding: '10px', background: 'white', borderRadius: '8px', marginBottom: '8px', border: `1px solid ${statusColor(item.status)}30`, boxShadow: '0 1px 3px rgba(0,0,0,0.05)' }}>
+              <img src={item.thumbnail} alt="" style={{ width: '50px', height: '50px', objectFit: 'cover', borderRadius: '6px', border: '1px solid #ddd', flexShrink: 0 }} />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: '13px', fontWeight: 'bold' }}>{categoryLabel(item.category)}{item.customFolder && ` / ${item.customFolder}`}</div>
+                {item.comment && <div style={{ fontSize: '11px', color: '#888', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.comment}</div>}
+                {item.error && <div style={{ fontSize: '11px', color: '#f44336' }}>エラー: {item.error}</div>}
+              </div>
+              <div style={{ fontSize: '20px', flexShrink: 0 }}>{statusIcon(item.status)}</div>
+              {(item.status === STATUS.PENDING || item.status === STATUS.FAILED) && (
+                <button onClick={() => removeFromQueue(item.id)} style={{ padding: '4px 8px', background: '#f5f5f5', border: '1px solid #ddd', borderRadius: '4px', cursor: 'pointer', fontSize: '12px', flexShrink: 0 }}>🗑</button>
+              )}
+            </div>
+          ))}
+
+          {/* アクションボタン */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: '10px', marginTop: '15px' }}>
+            {(queueCounts.pending > 0 || queueCounts.failed > 0) && !isUploading && (
+              <button onClick={processQueue} style={{ width: '100%', padding: '16px', fontSize: '17px', background: '#4CAF50', color: 'white', border: 'none', borderRadius: '12px', cursor: 'pointer', fontWeight: 'bold', boxShadow: '0 4px 6px rgba(0,0,0,0.2)' }}>
+                ☁ {queueCounts.pending + queueCounts.failed}枚をアップロード開始
+              </button>
+            )}
+            {queueCounts.failed > 0 && !isUploading && (
+              <button onClick={retryFailed} style={{ width: '100%', padding: '12px', background: '#FF5722', color: 'white', border: 'none', borderRadius: '8px', cursor: 'pointer', fontWeight: 'bold' }}>
+                🔄 失敗した{queueCounts.failed}枚を再アップロード
+              </button>
+            )}
+            {queueCounts.success > 0 && (
+              <button onClick={clearCompleted} style={{ width: '100%', padding: '12px', background: '#e0e0e0', border: 'none', borderRadius: '8px', cursor: 'pointer' }}>
+                🧹 完了済み({queueCounts.success}枚)をリストから削除
+              </button>
+            )}
+            {isUploading && (
+              <p style={{ textAlign: 'center', color: '#2196F3', fontWeight: 'bold' }}>⏳ アップロード処理中... 撮影に戻っても大丈夫です</p>
+            )}
+          </div>
+        </div>
+      )}
+
+      {status && <p style={{ marginTop: '15px', color: '#333', fontWeight: 'bold', fontSize: '14px' }}>{status}</p>}
     </div>
   );
 }
