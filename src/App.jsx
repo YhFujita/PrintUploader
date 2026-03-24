@@ -21,7 +21,7 @@ function App() {
   const fileInputRef = useRef(null);
   const [crop, setCrop] = useState();
   const [completedCrop, setCompletedCrop] = useState(null);
-  const [filterMode, setFilterMode] = useState('scanner');
+  const [filterMode, setFilterMode] = useState('shadow'); // 影補正をデフォルトに
 
   // ===== 保存設定（次に追加するアイテム用） =====
   const [selectedCategory, setSelectedCategory] = useState('kids');
@@ -147,7 +147,7 @@ function App() {
     setCustomFolder('');
     setExistingFolders([]);
     fetchExistingFolders(category);
-    if (category !== 'kids') setFilterMode('scanner'); else setFilterMode('none');
+    if (category !== 'kids') setFilterMode('shadow'); else setFilterMode('shadow');
   };
 
   // ===== キューに画像を追加 =====
