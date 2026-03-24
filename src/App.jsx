@@ -214,8 +214,8 @@ function App() {
     // 選択されたフィルタモード（書類、薄い文字など）をかける
     applyScannerFilter(ctx, targetWidth, targetHeight, filterMode);
 
-    // PDFにも使えるように、高解像度・高画質(1.0)の状態で一時保持する
-    const base64Image = canvas.toDataURL('image/jpeg', 1.0);
+    // プレビュー用に一時保持する（0.9画質で少し容量を抑えつつキレイに保つ）
+    const base64Image = canvas.toDataURL('image/jpeg', 0.9);
     setProcessedImage(base64Image);
     
     // ステップ3に進み、初期カテゴリのフォルダ一覧を取得しておく
@@ -285,27 +285,48 @@ function App() {
     });
   };
 
-  // --- PDFとしてBase64化するロジック (高解像度のままPDFのA4枠に貼り付け) ---
+  // --- PDFとしてBase64化するロジック (適度にリサイズして容量を削減) ---
   const getPdfBase64 = async (imageSrc) => {
     return new Promise((resolve) => {
       const img = new Image();
       img.onload = () => {
-        const doc = new jsPDF();
-        const pageWidth = doc.internal.pageSize.getWidth();
-        const pageHeight = doc.internal.pageSize.getHeight();
-        const margin = 10;
-        const targetWidth = pageWidth - (margin * 2);
-        
-        // アスペクト比を維持しつつ、PDFのA4サイズ(余白あり)に収める
-        let imgWidth = img.width; let imgHeight = img.height;
-        let finalWidth = targetWidth; let finalHeight = (imgHeight * finalWidth) / imgWidth;
-
-        if (finalHeight > (pageHeight - margin * 2)) {
-          finalHeight = pageHeight - (margin * 2); finalWidth = (imgWidth * finalHeight) / imgHeight;
+        // まず画像を適度なサイズに縮小してJPEG圧縮する（PDF容量削減の核心部分）
+        const compressCanvas = document.createElement('canvas');
+        const PDF_MAX_SIZE = 1600; // 長辺1600pxあればA4印刷でも十分きれい
+        const PDF_QUALITY = 0.65;  // JPEG品質65%（白黒文書なら劣化はほぼ目立たない）
+        let cw = img.width;
+        let ch = img.height;
+        if (cw > ch) {
+          if (cw > PDF_MAX_SIZE) { ch = Math.round(ch * (PDF_MAX_SIZE / cw)); cw = PDF_MAX_SIZE; }
+        } else {
+          if (ch > PDF_MAX_SIZE) { cw = Math.round(cw * (PDF_MAX_SIZE / ch)); ch = PDF_MAX_SIZE; }
         }
-        // JPEGとしてPDFに描画（元の高解像度データを使うため拡大してもボケにくい）
-        doc.addImage(img, 'JPEG', (pageWidth - finalWidth) / 2, margin, finalWidth, finalHeight);
-        resolve(doc.output('datauristring'));
+        compressCanvas.width = cw;
+        compressCanvas.height = ch;
+        const cctx = compressCanvas.getContext('2d');
+        cctx.drawImage(img, 0, 0, cw, ch);
+        // 圧縮済みの画像をData URL化
+        const compressedSrc = compressCanvas.toDataURL('image/jpeg', PDF_QUALITY);
+
+        // 圧縮済み画像をPDFのA4枠に貼り付ける
+        const pdfImg = new Image();
+        pdfImg.onload = () => {
+          const doc = new jsPDF();
+          const pageWidth = doc.internal.pageSize.getWidth();
+          const pageHeight = doc.internal.pageSize.getHeight();
+          const margin = 10;
+          const targetWidth = pageWidth - (margin * 2);
+
+          let imgWidth = pdfImg.width; let imgHeight = pdfImg.height;
+          let finalWidth = targetWidth; let finalHeight = (imgHeight * finalWidth) / imgWidth;
+
+          if (finalHeight > (pageHeight - margin * 2)) {
+            finalHeight = pageHeight - (margin * 2); finalWidth = (imgWidth * finalHeight) / imgHeight;
+          }
+          doc.addImage(pdfImg, 'JPEG', (pageWidth - finalWidth) / 2, margin, finalWidth, finalHeight);
+          resolve(doc.output('datauristring'));
+        };
+        pdfImg.src = compressedSrc;
       };
       img.src = imageSrc;
     });
